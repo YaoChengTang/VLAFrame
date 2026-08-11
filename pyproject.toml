@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlaframe"
+version = "0.1.0"
+description = "Random single-frame access over a large H.264 video corpus"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["video", "h264", "random-access", "dataloader", "vla", "decoding"]
+authors = [{name = "chengtang"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+    "Intended Audience :: Science/Research",
+]
+
+# 3.10 is the floor because that is the oldest interpreter this was actually run
+# on. The source uses `from __future__ import annotations` throughout and would
+# very likely work on 3.9, but untested is untested.
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.20",
+    # PyAV moves things between majors -- `av.Rational` disappeared in 17, for
+    # one -- so the floor is the oldest release in the verified matrix.
+    # Checked against av 16.1, 17.0, 17.1 and 18.0.
+    "av>=16",
+    # NOT optional. `vlaframe transcode` needs an ffmpeg binary, and the images
+    # this targets ship neither ffmpeg nor the root to install one; this wheel
+    # carries a static build with libx264 and libdav1d.
+    # Resolution order is $FFMPEG_BIN, then this wheel, then PATH -- the bundled
+    # build is preferred over a system one because a distro ffmpeg is often
+    # compiled without libx264, and that failure surfaces only mid-transcode.
+    "imageio-ffmpeg>=0.4",
+]
+
+[project.optional-dependencies]
+# Only `vlaframe get --out frame.png` needs Pillow; nothing in the library does.
+image = ["pillow>=9"]
+dev = ["pytest>=7", "pillow>=9"]
+
+[project.urls]
+Homepage = "https://github.com/YaoChengTang/VLAFrame"
+Repository = "https://github.com/YaoChengTang/VLAFrame"
+
+[project.scripts]
+vlaframe = "vlaframe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

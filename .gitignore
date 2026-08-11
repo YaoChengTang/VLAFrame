@@ -1,0 +1,13 @@
+# build artifacts
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# local index / corpus artifacts (never belong in the repo)
+*.vfi
