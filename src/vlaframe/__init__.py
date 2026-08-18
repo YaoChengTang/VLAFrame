@@ -14,7 +14,8 @@ Three pieces, in the order they are used:
     with FrameReader("corpus.vfi") as r:
         img = r.rgb(path, 1234)          # HxWx3 uint8, bit-identical to decord
 """
-from ._format import IndexFile, IndexWriter, VideoMeta
+from ._format import (HFLAG_PATHS_SORTED, IndexFile, IndexWriter, VideoMeta,
+                      seal_sorted)
 from .index import build_index, build_index_from_root, iter_videos, scan_video
 from .reader import DecoderPool, FrameReader
 from .transcode import (TranscodeResult, TranscodeSpec, count_frames,
@@ -26,6 +27,7 @@ __all__ = [
     "build_index", "build_index_from_root", "iter_videos", "scan_video",
     "transcode", "TranscodeSpec", "TranscodeResult", "probe", "count_frames",
     "target_dims", "ffmpeg_bin",
-    "IndexFile", "IndexWriter", "VideoMeta",
+    "IndexFile", "IndexWriter", "VideoMeta", "seal_sorted",
+    "HFLAG_PATHS_SORTED",
     "__version__",
 ]

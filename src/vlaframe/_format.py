@@ -2,11 +2,11 @@
 
 Layout, all little-endian, all offsets absolute from the start of the file::
 
-    header      64 B          magic, version, counts, section offsets
+    header      64 B          magic, version, counts, flags, section offsets
     paramtab    16 B * P      (offset, length) of each SPS/PPS blob
     paramblob   variable      the distinct avcC extradata, deduplicated
     strings     variable      NUL-terminated video paths
-    records     80 B * V      one fixed-size record per video: id -> record is O(1)
+    records     104 B * V     one fixed-size record per video: id -> record is O(1)
     arrays      variable      the per-frame arrays, 8-byte aligned
 
 What is deliberately NOT stored, and why
@@ -37,6 +37,24 @@ What is deliberately NOT stored, and why
 Net: ~8.3 B/frame instead of 29, so a 2.6-billion-frame corpus indexes to about
 22 GB rather than 76 GB. Being mmap-ed, a worker faults in only the pages of the
 videos it actually samples.
+
+Nothing is cached on the Python heap
+------------------------------------
+Every accessor here reads the mmap on each call. That is deliberate: this file
+is addressed by a DataLoader whose sampler is globally shuffled, so over one
+epoch a worker touches essentially every video, and any per-video memo grows
+without bound in *every* worker. On the 6.98 M video / 2.97 B frame corpus a
+memo of unpacked records alone measured 581 B/video = 4.05 GB per worker. A
+bounded cache would not help either -- the hit rate is structurally ~0, so an
+LRU is "no cache, plus bookkeeping".
+
+The one thing that made a memo tempting was ``path -> id``, which used to be a
+dict built over the whole file on first lookup. ``HFLAG_PATHS_SORTED`` replaces
+it: when the writer emitted the records in path order it says so in the header,
+and :meth:`IndexFile.find` bisects the mmap instead (~20 probes, ~10 us, against
+a ~20 ms decode). Indexes written before the flag existed are still read
+correctly -- an unset flag falls back to the dict, which is what they always
+did.
 """
 from __future__ import annotations
 
@@ -54,20 +72,30 @@ VERSION = 1
 # off_records, off_arrays, reserved
 HEADER_FMT = "<8sIIIIQQQQ8x"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
+# byte offset of the `flags` field, so it can be set in place on an existing
+# file without rewriting it (see `seal_sorted`)
+HEADER_FLAGS_OFF = struct.calcsize("<8sIII")
 
 # path_off, path_len, w, h, param_set, n_frames, n_keys, flags,
 # pos0, pts_base, pts_step, pad, off_size, off_disp, off_keys, off_ref,
 # off_pos, off_pts
 RECORD_FMT = "<QIHHIIIIQqiIQQQQQQ"
 RECORD_SIZE = struct.calcsize(RECORD_FMT)
+# just the (path_off, path_len) prefix -- the bisection reads nothing else
+PATH_FMT = "<QI"
 
+# header flags
+HFLAG_PATHS_SORTED = 1 << 0     # records are ordered by UTF-8 path bytes
+
+# per-video record flags
 FLAG_EXPLICIT_POS = 1 << 0
 FLAG_EXPLICIT_PTS = 1 << 1
 
 
 @dataclass(frozen=True)
 class VideoMeta:
-    """One video's record, unpacked. Cheap to build, cached by the reader."""
+    """One video's record, unpacked. Built fresh on every lookup, never memoed
+    -- see the module docstring for why."""
     vid: int
     path: str
     width: int
@@ -147,6 +175,12 @@ class IndexWriter:
         ))
 
     def write(self, out_path: str) -> dict:
+        # Emit in path order and say so in the header: that is what lets a
+        # reader bisect the mmap instead of building a path -> id dict over the
+        # whole file. Sorting on the encoded bytes, not the str, because the
+        # bisection compares the bytes as stored.
+        self._videos.sort(key=lambda v: v["path"].encode())
+
         V, P = len(self._videos), len(self._params)
         blobs = b"".join(self._params)
         strings = b"".join(v["path"].encode() + b"\0" for v in self._videos)
@@ -174,7 +208,8 @@ class IndexWriter:
             c += len(v["path"].encode()) + 1
 
         with open(out_path, "wb") as fh:
-            fh.write(struct.pack(HEADER_FMT, MAGIC, VERSION, V, P, 0,
+            fh.write(struct.pack(HEADER_FMT, MAGIC, VERSION, V, P,
+                                 HFLAG_PATHS_SORTED,
                                  off_paramtab, off_strings, off_records, off_arrays))
             o = 0
             for b in self._params:
@@ -227,7 +262,7 @@ class IndexFile:
         self.path = str(path)
         self._fh = open(self.path, "rb")
         self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
-        (magic, version, self.n_videos, self.n_params, _flags,
+        (magic, version, self.n_videos, self.n_params, self.flags,
          self._off_paramtab, self._off_strings, self._off_records,
          self._off_arrays) = struct.unpack_from(HEADER_FMT, self._mm, 0)
         if magic != MAGIC:
@@ -238,13 +273,14 @@ class IndexFile:
         for i in range(self.n_params):
             o, ln = struct.unpack_from("<QQ", self._mm, self._off_paramtab + 16 * i)
             self._params.append(bytes(self._mm[o:o + ln]))
-        self._meta: dict[int, VideoMeta] = {}
         self._by_path: dict[str, int] | None = None
 
+    @property
+    def paths_sorted(self) -> bool:
+        """True when records are in path order, so :meth:`find` can bisect."""
+        return bool(self.flags & HFLAG_PATHS_SORTED)
+
     def meta(self, vid: int) -> VideoMeta:
-        m = self._meta.get(vid)
-        if m is not None:
-            return m
         if not 0 <= vid < self.n_videos:
             raise IndexError(f"video id {vid} out of range (0..{self.n_videos-1})")
         (poff, plen, w, h, ps, nfr, nkeys, flags, pos0, pts_base, pts_step,
@@ -252,11 +288,9 @@ class IndexFile:
             RECORD_FMT, self._mm, self._off_records + RECORD_SIZE * vid)
         path = self._mm[self._off_strings + poff:
                         self._off_strings + poff + plen].decode()
-        m = VideoMeta(vid, path, w, h, ps, nfr, nkeys, flags, pos0,
-                      pts_base, pts_step,
-                      o_size, o_disp, o_keys, o_ref, o_pos, o_pts)
-        self._meta[vid] = m
-        return m
+        return VideoMeta(vid, path, w, h, ps, nfr, nkeys, flags, pos0,
+                         pts_base, pts_step,
+                         o_size, o_disp, o_keys, o_ref, o_pos, o_pts)
 
     def extradata(self, param_set: int) -> bytes:
         return self._params[param_set]
@@ -287,9 +321,52 @@ class IndexFile:
             return None
         return np.frombuffer(self._mm, np.int64, m.n_frames, m.off_pts)
 
+    def path_bytes(self, vid: int) -> bytes:
+        """One video's path, without unpacking the rest of its record.
+
+        The bisection probes ~20 records per lookup and needs nothing but the
+        path, so it reads the (offset, length) prefix rather than paying for a
+        whole :class:`VideoMeta`.
+        """
+        poff, plen = struct.unpack_from(
+            PATH_FMT, self._mm, self._off_records + RECORD_SIZE * vid)
+        return self._mm[self._off_strings + poff:self._off_strings + poff + plen]
+
+    def find(self, path: str) -> int | None:
+        """Video id for `path`, or None if this index does not cover it.
+
+        Bisects the mmap when the writer recorded that the records are in path
+        order. Otherwise falls back to the path -> id dict, which is what every
+        index written before ``HFLAG_PATHS_SORTED`` needs -- correctness never
+        depends on the flag, only the cost does.
+
+        Returning None rather than raising is what lets a caller probe several
+        indexes for a path; :meth:`FrameReader.vid_of` turns it into a KeyError
+        for the single-index case.
+        """
+        if not self.paths_sorted:
+            return self.path_to_id().get(str(path))
+        target = str(path).encode()
+        lo, hi = 0, self.n_videos
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.path_bytes(mid) < target:
+                lo = mid + 1
+            else:
+                hi = mid
+        # lo is the first record >= target; it is a hit only if it is equal.
+        if lo < self.n_videos and self.path_bytes(lo) == target:
+            return lo
+        return None
+
     def path_to_id(self) -> dict[str, int]:
-        """Built lazily: a corpus-scale index has millions of entries and most
-        callers address videos by id."""
+        """Fallback lookup for indexes that are not in path order.
+
+        One entry per video, so this is 4 GB on a 7 M video corpus and it lands
+        in every worker that touches it. :meth:`find` avoids it whenever
+        ``HFLAG_PATHS_SORTED`` is set; nothing in this package calls it
+        otherwise.
+        """
         if self._by_path is None:
             self._by_path = {self.meta(i).path: i for i in range(self.n_videos)}
         return self._by_path
@@ -305,3 +382,36 @@ class IndexFile:
 
     def __exit__(self, *exc):
         self.close()
+
+
+def seal_sorted(path: str) -> dict:
+    """Set ``HFLAG_PATHS_SORTED`` on an existing index, in place, if it earns it.
+
+    Indexes built before the flag existed are, in practice, already in path
+    order -- ``iter_videos`` walks each directory with ``sorted(files)`` and
+    ``build_index`` preserved that order. This checks rather than assumes
+    (a wrong flag makes the bisection return *another video's* frames, which
+    looks like a perfectly good image), and on success rewrites the 4-byte
+    header field only. Nothing else in the file moves, so it costs one
+    sequential pass over the records and a 4-byte write instead of a rebuild.
+
+    Returns a dict with ``sealed`` (whether the flag is now set) and ``reason``.
+    """
+    with IndexFile(path) as f:
+        if f.paths_sorted:
+            return dict(path=str(path), videos=f.n_videos, sealed=True,
+                        reason="already sealed")
+        prev = None
+        for vid in range(f.n_videos):
+            cur = f.path_bytes(vid)
+            if prev is not None and cur <= prev:
+                return dict(path=str(path), videos=f.n_videos, sealed=False,
+                            reason=f"not in path order at record {vid}: "
+                                   f"{prev.decode(errors='replace')!r} then "
+                                   f"{cur.decode(errors='replace')!r}")
+            prev = cur
+        videos = f.n_videos
+    with open(path, "r+b") as fh:
+        fh.seek(HEADER_FLAGS_OFF)
+        fh.write(struct.pack("<I", HFLAG_PATHS_SORTED))
+    return dict(path=str(path), videos=videos, sealed=True, reason="sealed")

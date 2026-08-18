@@ -1,4 +1,4 @@
-"""Command line: ``vlaframe transcode | index | info | get | bench``.
+"""Command line: ``vlaframe transcode | index | info | seal | get | bench``.
 
 Thin wrappers over the library. Everything the CLI does is available as a
 function; the CLI exists so a corpus sweep does not need a driver script.
@@ -6,6 +6,7 @@ function; the CLI exists so a corpus sweep does not need a driver script.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from ._format import seal_sorted
 from .index import build_index, iter_videos
 from .reader import FrameReader
 from .transcode import TranscodeSpec, probe, transcode
@@ -95,6 +97,9 @@ def _cmd_info(a) -> int:
         print(f"  videos       : {n:,}")
         print(f"  frames       : {frames:,}")
         print(f"  parameter sets: {r.index.n_params}")
+        lookup = "bisect (paths sorted)" if r.index.paths_sorted else \
+            "dict (paths not sorted -- see `vlaframe seal`)"
+        print(f"  path lookup  : {lookup}")
         print(f"  file size    : {os.path.getsize(a.index)/1e6:.1f} MB "
               f"({os.path.getsize(a.index)/max(frames,1):.2f} B/frame)")
         for i in range(min(a.show, n)):
@@ -102,6 +107,35 @@ def _cmd_info(a) -> int:
             print(f"    [{i}] {m.width}x{m.height} {m.n_frames:>7} frames  "
                   f"{m.n_keys:>5} keys  {m.path}")
     return 0
+
+
+def _cmd_seal(a) -> int:
+    """Upgrade indexes written before `HFLAG_PATHS_SORTED` existed.
+
+    Every one of them checked so far was already in path order, so this is a
+    verified 4-byte header write rather than a rebuild. Unsealed indexes still
+    read correctly -- they just fall back to the path -> id dict, which is the
+    memory this flag exists to avoid.
+    """
+    paths = []
+    for p in a.index:
+        paths.extend(sorted(glob.glob(p)) if any(c in p for c in "*?[") else [p])
+    if not paths:
+        print("no index files matched", file=sys.stderr)
+        return 1
+    sealed = failed = 0
+    for p in paths:
+        r = seal_sorted(p)
+        if r["sealed"]:
+            sealed += 1
+            if a.verbose:
+                print(f"  {r['reason']:14s} {r['videos']:>8,} videos  {p}", flush=True)
+        else:
+            failed += 1
+            print(f"  NOT SEALED {p}\n    {r['reason']}", flush=True)
+    print(f"\nsealed {sealed}/{len(paths)}"
+          f"{f', {failed} not in path order' if failed else ''}")
+    return 1 if failed else 0
 
 
 def _cmd_get(a) -> int:
@@ -177,6 +211,12 @@ def main(argv=None) -> int:
     f = sub.add_parser("info", help="summarise an index")
     f.add_argument("index"); f.add_argument("--show", type=int, default=5)
     f.set_defaults(fn=_cmd_info)
+
+    s = sub.add_parser("seal", help="mark an existing index as path-sorted, "
+                                    "in place, after verifying that it is")
+    s.add_argument("index", nargs="+", help="paths or globs")
+    s.add_argument("--verbose", "-v", action="store_true")
+    s.set_defaults(fn=_cmd_seal)
 
     g = sub.add_parser("get", help="decode one frame")
     g.add_argument("index"); g.add_argument("video"); g.add_argument("frame", type=int)

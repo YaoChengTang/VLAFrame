@@ -68,7 +68,8 @@ vlaframe transcode /raw /clips --max-side 640             # cap the longer edge
 
 # 2. index it
 vlaframe index /clips corpus.vfi
-vlaframe info corpus.vfi
+vlaframe info corpus.vfi                       # reports whether lookups bisect
+vlaframe seal 'shards/*.vfi'                   # upgrade indexes built before v0.1.1
 
 # 3. read
 vlaframe get corpus.vfi 0 1234 --out frame.png
@@ -88,8 +89,13 @@ img = r.rgb(video_id_or_path, frame_index)     # HxWx3 uint8
 ```
 
 `FrameReader` is neither thread-safe nor fork-safe once used — the decoder
-context and cached file descriptors belong to the process that created them.
-Construct one per worker, inside the worker.
+context belongs to the process that created it. Construct one per worker,
+inside the worker.
+
+**It holds no per-video state.** Address a video by path and the lookup bisects
+the mmap; nothing is memoised between calls. This is what makes a worker's
+memory independent of how much of the corpus it has sampled — see
+[Memory](#memory).
 
 ## Why it is fast
 
@@ -254,6 +260,83 @@ necessary for this package, which handles any reorder depth.
 
 `crf` and `profile` change quality and compatibility, not seek behaviour.
 
+## Memory
+
+A worker's resident memory does not grow with the number of videos it has
+sampled. That is a property worth stating explicitly, because the obvious
+implementation does not have it: memoising per video looks free on a benchmark
+that touches a handful of clips and is fatal on a corpus.
+
+Four memos were removed for this reason. Measured on a 6.98 M video /
+2.97 B frame corpus, per DataLoader worker:
+
+| Removed | What it held | Cost |
+|---|---|---|
+| `FrameReader._rank` | decode-order → display-rank permutation | 8 B/frame = **23.8 GB** |
+| `IndexFile._meta` | unpacked `VideoMeta` per video | 474 B/video = **3.3 GB** |
+| `IndexFile._by_path` | path → id dict, built in full on first lookup | 107 B/video = **0.75 GB** |
+| `FrameReader._fds` | one open mp4 descriptor per video, never evicted | **6.98 M descriptors** |
+
+None was replaced with a bounded cache. The hit rate is not merely low, it is
+structurally zero: the sampler is globally shuffled and a run of this size does
+not finish an epoch, so a video is touched about once and any per-video cache is
+a miss followed by bookkeeping. (The same argument, on the same corpus, is why
+the consumer's `decord_pool` backend was deleted.) On a small working set where
+the hit rate is *not* zero an LRU does pay — 182 videos, capacity 512, 97.6% hits
+— so this is a property of the workload, not a claim that caching is wrong.
+
+What replaces the path → id dict is a bisection of the mmap, enabled by the
+`HFLAG_PATHS_SORTED` header flag that the writer now sets after emitting records
+in path order. Indexes written before the flag existed are read correctly either
+way — an unset flag falls back to the dict — and `vlaframe seal` sets it in
+place, after verifying the order, by rewriting 4 header bytes rather than
+rebuilding the file.
+
+Measured over 3,000 reads touching 3,200 distinct videos, private anonymous
+memory:
+
+```
+before   RssAnon  3.4 -> 80.9 MB    +25,816 B/read
+after    RssAnon  0.7 ->  0.1 MB       -188 B/read
+```
+
+Run the gate:
+
+```bash
+python tests/test_memory.py --index corpus.vfi --reads 4000
+```
+
+### What this costs, and where
+
+Recomputing is cheaper than the memo it replaces on every axis but one:
+
+| Per read | Cost |
+|---|---|
+| `_pts` scatter, 900 / 5,000 / 13,000 frames | 3.9 / 14.2 / 107 µs |
+| `struct.unpack_from` of one record | 0.4 µs |
+| bisection, V = 10,000 (≈14 probes) | 6.3 µs |
+| **`os.open` + `os.close`** | **see below** |
+
+The descriptor is the exception, and only on some filesystems. Locally it is
+2 µs and invisible. On an NFSv4 export mounted `lookupcache=none` — which is
+where this corpus lives — every `open` is a LOOKUP round trip and every `close`
+is a CLOSE round trip:
+
+```
+open  (fd kept)   2.488 ms
+close             1.255 ms
+open + close      3.435 ms
+```
+
+So on that mount, opening per read costs about **+1 ms per view** against
+keeping the descriptor, even with no reuse at all, and more where there is
+reuse. Measured end to end at 640x400, p50 per frame: 13.9 ms holding
+descriptors, 15.9 ms opening per read. That is the price of bounded memory on
+this mount, and it is paid in the mount, not in this package: `lookupcache=pos`
+returns `open` to microseconds and makes the trade free. The dentry cache it
+enables is reclaimable slab, about 1.2 KB per distinct file touched.
+
+
 ## Repository layout
 
 ```
@@ -262,7 +345,8 @@ src/vlaframe/
     index.py       function 2 — offline index construction
     reader.py      function 3 — online random access
     _format.py     the .vfi binary format
-    cli.py         vlaframe transcode | index | info | get | bench
+    cli.py         vlaframe transcode | index | info | seal | get | bench
 tests/
     test_correctness.py   the bit-exactness gate
+    test_memory.py        the no-per-video-state gate
 ```

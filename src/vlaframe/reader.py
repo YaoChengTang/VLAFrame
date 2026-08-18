@@ -92,9 +92,30 @@ class DecoderPool:
 class FrameReader:
     """Random single-frame access over an indexed corpus.
 
-    Not thread-safe and not fork-safe once used: a decoder context and the cached
-    file descriptors belong to the process that made them. In a DataLoader,
-    construct one per worker.
+    Not thread-safe and not fork-safe once used: a decoder context belongs to
+    the process that made it. In a DataLoader, construct one per worker.
+
+    Holds no per-video state. An earlier version memoised the decode-order ->
+    display-rank permutation and kept every mp4 descriptor it had opened, on the
+    reasoning that a worker only pays for the videos it samples. That premise
+    does not survive a globally shuffled sampler over a corpus this size: the
+    permutation grew to 8 B/frame (23.8 GB on a 2.97 B frame corpus) and the
+    descriptors to one per video (6.98 M), in every one of 32 workers.
+
+    Neither was replaced with a bounded cache, for the same reason the
+    ``decord_pool`` backend was deleted from the consumer: the hit rate is
+    structurally zero, not merely low. A run that cannot finish an epoch touches
+    each video about once, so any cache keyed on the video is a miss followed by
+    bookkeeping. Measured on a small working set where the hit rate is *not*
+    zero (182 videos, an LRU of 512) it does pay -- so this is a property of the
+    workload, not a claim that caching is wrong.
+
+    What that leaves is one ``os.open`` per read. On a local filesystem it is
+    ~2 us and invisible. On the NFS export this corpus lives on it is 3.1 ms,
+    because that mount sets ``lookupcache=none`` and every open costs a LOOKUP
+    round trip -- a tax the previous version paid too, on every first touch, and
+    one no cache can avoid at ~1 touch per video. It is fixed at the mount, not
+    here.
     """
 
     def __init__(self, index_path: str, *, backend: str = "cpu", threads: int = 1,
@@ -103,21 +124,16 @@ class FrameReader:
         self.backend = backend
         self.persistent = persistent
         self.pool = DecoderPool(backend, threads)
-        self._fds: dict[int, int] = {}
-        # decode-order packet -> display rank, needed to reconstruct timestamps
-        # from base+step. Built on first touch of a video, so a worker only pays
-        # for the videos it samples.
-        self._rank: dict[int, np.ndarray] = {}
 
     # ── addressing ────────────────────────────────────────────────────
     def __len__(self) -> int:
         return self.index.n_videos
 
     def vid_of(self, path: str) -> int:
-        try:
-            return self.index.path_to_id()[str(path)]
-        except KeyError:
-            raise KeyError(f"{path} is not in this index") from None
+        vid = self.index.find(path)
+        if vid is None:
+            raise KeyError(f"{path} is not in this index")
+        return vid
 
     def _resolve(self, video: int | str) -> VideoMeta:
         return self.index.meta(video if isinstance(video, int) else self.vid_of(video))
@@ -134,24 +150,19 @@ class FrameReader:
 
     # ── plumbing ──────────────────────────────────────────────────────
     def _pts(self, m: VideoMeta) -> np.ndarray:
-        """Presentation timestamp per packet, in decode order."""
+        """Presentation timestamp per packet, in decode order.
+
+        The scatter below inverts the display permutation; it costs 3.9 us on a
+        900-frame clip and 14.2 us on a 5000-frame one, which is why it is not
+        worth memoising (see the class docstring).
+        """
         explicit = self.index.timestamps(m)
         if explicit is not None:
             return explicit
-        rank = self._rank.get(m.vid)
-        if rank is None:
-            disp = self.index.by_display(m).astype(np.int64)
-            rank = np.empty(m.n_frames, dtype=np.int64)
-            rank[disp] = np.arange(m.n_frames, dtype=np.int64)
-            self._rank[m.vid] = rank
+        disp = self.index.by_display(m).astype(np.int64)
+        rank = np.empty(m.n_frames, dtype=np.int64)
+        rank[disp] = np.arange(m.n_frames, dtype=np.int64)
         return m.pts_base + rank * m.pts_step
-
-    def _fd(self, m: VideoMeta) -> int:
-        fd = self._fds.get(m.vid)
-        if fd is None:
-            fd = os.open(m.path, os.O_RDONLY)
-            self._fds[m.vid] = fd
-        return fd
 
     def _plan(self, m: VideoMeta, frame: int) -> tuple[int, int, list[tuple[int, int, int]]]:
         """Work out what to read and what to feed.
@@ -211,7 +222,14 @@ class FrameReader:
         """Decode one frame and return it as an ``av.VideoFrame`` (yuv420p)."""
         m = self._resolve(video)
         lo, hi, feed = self._plan(m, frame)
-        buf = os.pread(self._fd(m), hi - lo, lo)
+        # try/finally, not a bare close after the read: a read that raises would
+        # otherwise leak the descriptor, and at corpus scale that is an EMFILE a
+        # few thousand samples later rather than an obvious failure here.
+        fd = os.open(m.path, os.O_RDONLY)
+        try:
+            buf = os.pread(fd, hi - lo, lo)
+        finally:
+            os.close(fd)
 
         extradata = self.index.extradata(m.param_set)
         cc = self.pool.acquire(m.param_set, extradata) if self.persistent \
@@ -249,13 +267,6 @@ class FrameReader:
 
     # ── lifecycle ─────────────────────────────────────────────────────
     def close(self) -> None:
-        for fd in self._fds.values():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self._fds.clear()
-        self._rank.clear()
         self.pool.close()
         self.index.close()
 
