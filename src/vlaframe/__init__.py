@@ -17,6 +17,7 @@ Three pieces, in the order they are used:
 from ._format import (HFLAG_PATHS_SORTED, IndexFile, IndexWriter, VideoMeta,
                       seal_sorted)
 from .index import build_index, build_index_from_root, iter_videos, scan_video
+from .merge import merge_indexes, verify_merge
 from .reader import DecoderPool, FrameReader
 from .transcode import (TranscodeResult, TranscodeSpec, count_frames,
                         ffmpeg_bin, probe, target_dims, transcode)
@@ -28,6 +29,7 @@ __all__ = [
     "transcode", "TranscodeSpec", "TranscodeResult", "probe", "count_frames",
     "target_dims", "ffmpeg_bin",
     "IndexFile", "IndexWriter", "VideoMeta", "seal_sorted",
+    "merge_indexes", "verify_merge",
     "HFLAG_PATHS_SORTED",
     "__version__",
 ]

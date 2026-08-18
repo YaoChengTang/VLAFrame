@@ -66,8 +66,9 @@ vlaframe transcode /raw /clips --gop 30 --crf 23 --profile high
 vlaframe transcode /raw /clips --gop 8 --bframes 0        # faster seeks, more bytes
 vlaframe transcode /raw /clips --max-side 640             # cap the longer edge
 
-# 2. index it
+# 2. index it (shard a large corpus, then merge the shards back)
 vlaframe index /clips corpus.vfi
+vlaframe merge corpus.vfi 'shards/*.vfi' --verify
 vlaframe info corpus.vfi                       # reports whether lookups bisect
 vlaframe seal 'shards/*.vfi'                   # upgrade indexes built before v0.1.1
 
@@ -344,9 +345,11 @@ src/vlaframe/
     transcode.py   function 1 — format conversion
     index.py       function 2 — offline index construction
     reader.py      function 3 — online random access
+    merge.py       function 4 — combine shards, byte for byte
     _format.py     the .vfi binary format
-    cli.py         vlaframe transcode | index | info | seal | get | bench
+    cli.py         vlaframe transcode | index | merge | info | seal | get | bench
 tests/
     test_correctness.py   the bit-exactness gate
     test_memory.py        the no-per-video-state gate
+    test_merge.py         the merge-is-indistinguishable gate
 ```

@@ -1,4 +1,4 @@
-"""Command line: ``vlaframe transcode | index | info | seal | get | bench``.
+"""Command line: ``vlaframe transcode | index | merge | info | seal | get | bench``.
 
 Thin wrappers over the library. Everything the CLI does is available as a
 function; the CLI exists so a corpus sweep does not need a driver script.
@@ -17,6 +17,7 @@ from pathlib import Path
 from . import __version__
 from ._format import seal_sorted
 from .index import build_index, iter_videos
+from .merge import merge_indexes
 from .reader import FrameReader
 from .transcode import TranscodeSpec, probe, transcode
 
@@ -86,6 +87,46 @@ def _cmd_index(a) -> int:
           f"built in {time.perf_counter()-t0:.0f}s")
     for p, e in st["failures"]:
         print(f"  FAILED {e}  {p}")
+    return 0
+
+
+def _cmd_merge(a) -> int:
+    """Combine index shards into one `.vfi`.
+
+    Shards are how a corpus-scale index gets *built* (one `IndexWriter` cannot
+    buffer seven million videos); merging is what keeps that from leaking into
+    how it is *read*.
+    """
+    inputs = []
+    for p in a.inputs:
+        inputs.extend(sorted(glob.glob(p)) if any(c in p for c in "*?[") else [p])
+    if not inputs:
+        print("no input indexes matched", file=sys.stderr)
+        return 1
+    print(f"merging {len(inputs)} shard(s) -> {a.out}", flush=True)
+    t0 = time.perf_counter()
+
+    def progress(i, n, path):
+        if i % 20 == 0 or i == n:
+            print(f"  planned [{i}/{n}] {time.perf_counter()-t0:.0f}s", flush=True)
+
+    st = merge_indexes(inputs, a.out, on_duplicate=a.on_duplicate,
+                       verify=a.verify, progress=progress)
+    print(f"\n{st['videos']:,} videos, {st['frames']:,} frames, "
+          f"{st['input_param_sets']} -> {st['param_sets']} parameter set(s)")
+    if st["duplicates"]:
+        print(f"  {st['duplicates']} duplicate path(s) resolved by "
+              f"--on-duplicate={a.on_duplicate}")
+    if st["empty_inputs"]:
+        print(f"  {st['empty_inputs']} empty shard(s) skipped")
+    print(f"  {st['explicit_pos']} explicit pos, {st['explicit_pts']} explicit pts "
+          f"(carried, never recomputed)")
+    print(f"  {st['bytes']/1e6:.1f} MB = {st['bytes_per_frame']:.2f} B/frame "
+          f"in {time.perf_counter()-t0:.0f}s")
+    if a.verify:
+        v = st["verified"]
+        print(f"  VERIFIED {v['videos']:,} videos / {v['arrays']:,} arrays "
+              f"byte-for-byte against {v['inputs']} input(s)")
     return 0
 
 
@@ -207,6 +248,16 @@ def main(argv=None) -> int:
     i.add_argument("--limit", type=int, default=0)
     i.add_argument("--video-dirs-only", dest="video_dirs_only", action="store_true")
     i.set_defaults(fn=_cmd_index)
+
+    m = sub.add_parser("merge", help="combine index shards into one .vfi")
+    m.add_argument("out")
+    m.add_argument("inputs", nargs="+", help="paths or globs")
+    m.add_argument("--on-duplicate", dest="on_duplicate", default="error",
+                   choices=("error", "first", "last"))
+    m.add_argument("--verify", action="store_true",
+                   help="re-open output and inputs and compare every video and "
+                        "every array byte for byte")
+    m.set_defaults(fn=_cmd_merge)
 
     f = sub.add_parser("info", help="summarise an index")
     f.add_argument("index"); f.add_argument("--show", type=int, default=5)
