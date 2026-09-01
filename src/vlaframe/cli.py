@@ -152,7 +152,11 @@ def _cmd_info(a) -> int:
         print(f"  paths        : "
               + ("relative to a root" if r.index.relative_paths else "absolute"))
         print(f"  stored root  : {r.index.stored_root or '(none)'}")
-        if r.index.root != r.index.stored_root:
+        if r.index.root_override_ignored:
+            print(f"  root override: IGNORED -- this index stores absolute "
+                  f"paths, so there is no prefix to replace. `vlaframe rebase "
+                  f"--root ...` first.")
+        elif r.index.root != r.index.stored_root:
             print(f"  root override: {r.index.root}")
         print(f"  file size    : {os.path.getsize(a.index)/1e6:.1f} MB "
               f"({os.path.getsize(a.index)/max(frames,1):.2f} B/frame)")

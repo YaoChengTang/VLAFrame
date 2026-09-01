@@ -395,4 +395,5 @@ tests/
     test_correctness.py   the bit-exactness gate
     test_memory.py        the no-per-video-state gate
     test_merge.py         the merge-is-indistinguishable gate
+    test_root.py          the path-root gate
 ```

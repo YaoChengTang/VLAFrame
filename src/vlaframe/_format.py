@@ -339,6 +339,11 @@ class IndexFile:
     index survive a corpus that moved: the stored root describes where the
     videos were when it was built, and a caller that knows better says so
     instead of rebuilding 25 GB of index to change one string.
+
+    It is ignored on an index whose strings are absolute -- there is no stored
+    prefix for it to replace -- so a caller may pass it unconditionally while
+    some of its indexes are still unmigrated. :attr:`root_override_ignored`
+    records when that happened.
     """
 
     def __init__(self, path: str, root: str | None = None):
@@ -361,7 +366,16 @@ class IndexFile:
             if end < 0:
                 raise ValueError(f"{path}: root string is not NUL-terminated")
             self.stored_root = self._mm[self._off_root:end].decode()
-        self.root = normalize_root(self.stored_root if root is None else root)
+        # An override only means something when there is a stored prefix to
+        # replace. An index whose strings are absolute has none, and honouring
+        # `root` there would strip it off queries and then compare the remainder
+        # against absolute records -- every lookup missing, which is exactly the
+        # failure this whole mechanism exists to remove. A caller that passes
+        # `root` for every leaf it opens, migrated or not, therefore gets the
+        # old behaviour on the old indexes rather than a broken one.
+        self.root_override_ignored = bool(root is not None and not self.stored_root)
+        self.root = "" if self.root_override_ignored else normalize_root(
+            self.stored_root if root is None else root)
         self._params: list[bytes] = []
         for i in range(self.n_params):
             o, ln = struct.unpack_from("<QQ", self._mm, self._off_paramtab + 16 * i)
