@@ -112,10 +112,21 @@ def _rewrite(target: str, old_root: str, new_root: str,
         fh.write(b"\0" * (off_records - end))
 
         offset = 0
+        # The records block is read, patched and written as one range rather
+        # than seeking to each record. Only the 12-byte (path_off, path_len)
+        # prefix of each 104-byte record changes, but doing that with a seek per
+        # record costs two syscalls per video -- on a 733,278-video index over
+        # NFS that dominated the whole rebase, well past the cost of copying the
+        # file. The block is 104 B/video, so holding it is ~100 MB on the
+        # largest index here.
+        fh.seek(off_records)
+        block = bytearray(fh.read(RECORD_SIZE * n_videos))
         for vid, p in enumerate(new_paths):
-            fh.seek(off_records + RECORD_SIZE * vid)
-            fh.write(struct.pack(PATH_FMT, offset, len(p.encode())))
-            offset += len(p.encode()) + 1
+            n = len(p.encode())
+            struct.pack_into(PATH_FMT, block, RECORD_SIZE * vid, offset, n)
+            offset += n + 1
+        fh.seek(off_records)
+        fh.write(block)
         fh.flush()
         os.fsync(fh.fileno())
     return dict(strings_bytes=len(strings), gap_bytes=off_records - end)
