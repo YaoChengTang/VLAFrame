@@ -89,17 +89,25 @@ def cases_for(reader: FrameReader, vid: int, max_kf: int, n_rand: int,
 
 
 def run(index_path: str, backend: str, mode: str, videos: int, max_kf: int,
-        n_rand: int, seed: int, pix: str, check_power: bool) -> dict:
+        n_rand: int, seed: int, pix: str, check_power: bool,
+        root: str | None = None) -> dict:
     rnd = random.Random(seed)
-    r = FrameReader(index_path, backend=backend, persistent=(mode == "persistent"))
+    r = FrameReader(index_path, root=root, backend=backend,
+                    persistent=(mode == "persistent"))
     picks = rnd.sample(range(len(r)), min(videos, len(r)))
     stats: Counter = Counter()
     bad: list[tuple[str, int, str]] = []
     for vid in picks:
         m = r.index.meta(vid)
+        # `m.path` is what the index *stores*, which is relative when the index
+        # has a root. libavformat needs the file, so the reference opens the
+        # resolved path -- passing the stored one made every reference raise,
+        # and every raise is counted as an exclusion, so the gate reported a
+        # pass over zero comparisons.
+        src = r.index.join_root(m.path)
         for idx in cases_for(r, vid, max_kf, n_rand, rnd):
             try:
-                ref = reference_frame(m.path, idx, pix)
+                ref = reference_frame(src, idx, pix)
             except Exception:
                 stats["ref_error"] += 1
                 continue
@@ -107,7 +115,7 @@ def run(index_path: str, backend: str, mode: str, videos: int, max_kf: int,
                 got = r.frame(vid, idx).to_ndarray(format=pix)
             except Exception as exc:
                 stats["read_error"] += 1
-                bad.append((m.path, idx, f"{type(exc).__name__}: {exc}"))
+                bad.append((src, idx, f"{type(exc).__name__}: {exc}"))
                 continue
             stats["total"] += 1
             if got.shape == ref.shape and np.array_equal(got, ref):
@@ -115,14 +123,14 @@ def run(index_path: str, backend: str, mode: str, videos: int, max_kf: int,
             else:
                 d = int(np.abs(got.astype(np.int16) - ref.astype(np.int16)).max()) \
                     if got.shape == ref.shape else -1
-                bad.append((m.path, idx, f"pixels differ, max |delta| = {d}"))
+                bad.append((src, idx, f"pixels differ, max |delta| = {d}"))
             if check_power:
                 for step in (-1, 1):
                     j = idx + step
                     if not 0 <= j < m.n_frames:
                         continue
                     try:
-                        other = reference_frame(m.path, j, pix)
+                        other = reference_frame(src, j, pix)
                     except Exception:
                         continue
                     if other.shape == ref.shape and not np.array_equal(other, ref):
@@ -136,6 +144,9 @@ def run(index_path: str, backend: str, mode: str, videos: int, max_kf: int,
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--index", required=True)
+    ap.add_argument("--root", default=None,
+                    help="resolve the index's stored paths against this prefix "
+                         "instead of the one recorded in the file")
     ap.add_argument("--videos", type=int, default=6)
     ap.add_argument("--max-kf", dest="max_kf", type=int, default=5)
     ap.add_argument("--rand", type=int, default=5)
@@ -153,10 +164,22 @@ def main(argv=None) -> int:
     for backend in [b.strip() for b in a.backend.split(",")]:
         for mode in [m.strip() for m in a.modes.split(",")]:
             res = run(a.index, backend, mode, a.videos, a.max_kf, a.rand,
-                      a.seed, a.pix, not a.no_power)
+                      a.seed, a.pix, not a.no_power, a.root)
             s = res["stats"]
             tot, ex = s["total"], s["exact"]
             failures += (tot - ex) + s["read_error"]
+            # A run that compared nothing is not a pass. Every reference error
+            # is silently excluded, so a broken reference path -- a relative
+            # stored path handed to libavformat, say -- otherwise reports
+            # "0/0" and GATE PASSED, which is precisely the false green this
+            # file exists to refuse.
+            if tot == 0:
+                failures += 1
+                print(f"\n=== backend={backend:4s} mode={mode:10s} pix={a.pix} ===")
+                print(f"  NO COMPARISONS MADE ({s['ref_error']} reference "
+                      f"error(s), {s['read_error']} read error(s)) -- a gate "
+                      f"that checked nothing does not pass")
+                continue
             print(f"\n=== backend={backend:4s} mode={mode:10s} pix={a.pix} ===")
             print(f"  cases            : {tot}")
             print(f"  bit-exact        : {ex}/{tot}"

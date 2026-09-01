@@ -15,9 +15,10 @@ Three pieces, in the order they are used:
         img = r.rgb(path, 1234)          # HxWx3 uint8, bit-identical to decord
 """
 from ._format import (HFLAG_PATHS_SORTED, IndexFile, IndexWriter, VideoMeta,
-                      seal_sorted)
+                      normalize_root, relative_to_root, seal_sorted)
 from .index import build_index, build_index_from_root, iter_videos, scan_video
 from .merge import merge_indexes, verify_merge
+from .rebase import rebase_index
 from .reader import DecoderPool, FrameReader
 from .transcode import (TranscodeResult, TranscodeSpec, count_frames,
                         ffmpeg_bin, probe, target_dims, transcode)
@@ -29,7 +30,8 @@ __all__ = [
     "transcode", "TranscodeSpec", "TranscodeResult", "probe", "count_frames",
     "target_dims", "ffmpeg_bin",
     "IndexFile", "IndexWriter", "VideoMeta", "seal_sorted",
-    "merge_indexes", "verify_merge",
+    "normalize_root", "relative_to_root",
+    "merge_indexes", "verify_merge", "rebase_index",
     "HFLAG_PATHS_SORTED",
     "__version__",
 ]

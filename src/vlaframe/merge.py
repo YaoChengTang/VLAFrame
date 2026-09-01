@@ -29,6 +29,12 @@ about the image looks wrong. The two traps this package already documents
 
 The output is written in path order with ``HFLAG_PATHS_SORTED`` set, so a merged
 index is also a bisectable one.
+
+All inputs must share one root. The stored strings are relative to it, so
+merging two shards that disagree would produce a file in which half the paths
+resolve against the wrong prefix -- and since the records themselves would all
+look well formed, the first sign of it would be a missing file at read time.
+That is refused rather than resolved.
 """
 from __future__ import annotations
 
@@ -105,6 +111,7 @@ def merge_indexes(inputs: Iterable[str], out_path: str, *,
     n_in_params = 0
 
     try:
+        roots: dict[str, str] = {}                       # root -> first input using it
         for si, path in enumerate(inputs):
             f = IndexFile(path)                          # validates magic/version
             srcs.append(f)
@@ -112,6 +119,18 @@ def merge_indexes(inputs: Iterable[str], out_path: str, *,
             if f.n_videos == 0:
                 empty += 1
                 continue
+            # Every shard has to agree on the root, or the merged strings would
+            # be relative to two different places and only one of them could be
+            # right. Refused rather than resolved: picking one silently is how a
+            # merged index ends up naming files that are not there.
+            if f.stored_root not in roots:
+                roots[f.stored_root] = path
+                if len(roots) > 1:
+                    a, b = list(roots.items())[:2]
+                    raise ValueError(
+                        f"inputs disagree on the index root:\n"
+                        f"  {a[0]!r} in {a[1]}\n  {b[0]!r} in {b[1]}\n"
+                        f"Rebuild or `vlaframe rebase` them onto one root first.")
             remap = {}
             for old in range(f.n_params):
                 blob = f.extradata(old)
@@ -158,11 +177,14 @@ def merge_indexes(inputs: Iterable[str], out_path: str, *,
 
         # ── layout, in the order IndexWriter.write() emits ─────────────
         V, P = len(plan), len(blobs)
+        root = next(iter(roots), "")
         blob_bytes = b"".join(blobs)
         strings = b"".join(r[0] + b"\0" for r in plan)
+        root_blob = (root.encode() + b"\0") if root else b""
         off_paramtab = HEADER_SIZE
         off_blobs = off_paramtab + 16 * P
-        off_strings = off_blobs + len(blob_bytes)
+        off_root = (off_blobs + len(blob_bytes)) if root_blob else 0
+        off_strings = off_blobs + len(blob_bytes) + len(root_blob)
         off_records = _align(off_strings + len(strings))
         off_arrays = _align(off_records + RECORD_SIZE * V)
 
@@ -204,12 +226,14 @@ def merge_indexes(inputs: Iterable[str], out_path: str, *,
             with open(tmp, "wb") as fh:
                 fh.write(struct.pack(HEADER_FMT, MAGIC, VERSION, V, P,
                                      HFLAG_PATHS_SORTED, off_paramtab,
-                                     off_strings, off_records, off_arrays))
+                                     off_strings, off_records, off_arrays,
+                                     off_root))
                 o = 0
                 for b in blobs:
                     fh.write(struct.pack("<QQ", off_blobs + o, len(b)))
                     o += len(b)
                 fh.write(blob_bytes)
+                fh.write(root_blob)
                 fh.write(strings)
                 _pad_to(fh, off_records)
                 for i, r in enumerate(plan):
@@ -240,7 +264,7 @@ def merge_indexes(inputs: Iterable[str], out_path: str, *,
         total = os.path.getsize(out_path)
         frames = sum(r[5] for r in plan)
         stats = dict(
-            videos=V, frames=frames, param_sets=P, bytes=total,
+            videos=V, frames=frames, param_sets=P, bytes=total, root=root,
             bytes_per_frame=total / max(frames, 1),
             inputs=len(inputs), empty_inputs=empty, duplicates=duplicates,
             input_param_sets=n_in_params,
@@ -283,6 +307,11 @@ def verify_merge(inputs: Iterable[str], out_path: str) -> dict:
         for path in inputs:
             src = IndexFile(path)
             try:
+                if src.n_videos and src.stored_root != out.stored_root:
+                    raise ValueError(
+                        f"{path}: root is {src.stored_root!r} but the merge "
+                        f"stored {out.stored_root!r}; the paths in the two "
+                        f"files are relative to different places")
                 for vid in range(src.n_videos):
                     a = src.meta(vid)
                     got = out.find(a.path)
