@@ -111,15 +111,20 @@ def iter_videos(root: str | Path, suffixes: tuple[str, ...] = (".mp4",),
 
 
 def build_index(videos: Iterable[str | Path], out_path: str | Path,
-                *, on_error: str = "skip",
+                *, root: str = "", on_error: str = "skip",
                 progress: Callable[[int, int, str], None] | None = None) -> dict:
     """Index every video in `videos` into a single ``.vfi`` file.
+
+    `root` is the prefix the stored paths are relative to. Every video has to
+    live under it. Passing one is what keeps the index from being a function of
+    where the corpus is mounted; leaving it empty stores absolute paths, which
+    is what indexes built before roots existed did.
 
     `on_error='skip'` keeps going and reports the count, which is what a
     corpus-scale sweep wants; `'raise'` stops at the first bad file.
     """
     videos = list(videos)
-    writer = IndexWriter()
+    writer = IndexWriter(root)
     failed: list[tuple[str, str]] = []
     for i, path in enumerate(videos, 1):
         try:
@@ -141,10 +146,16 @@ def build_index(videos: Iterable[str | Path], out_path: str | Path,
     return stats
 
 
-def build_index_from_root(root: str | Path, out_path: str | Path, **kw) -> dict:
-    """Convenience wrapper: walk `root` for mp4 and index all of them."""
+def build_index_from_root(root: str | Path, out_path: str | Path,
+                          *, relative: bool = True, **kw) -> dict:
+    """Convenience wrapper: walk `root` for mp4 and index all of them.
+
+    ``relative`` stores the paths under `root` rather than absolute, which is
+    almost always what is wanted -- the tree being walked *is* the shared
+    prefix. Pass ``relative=False`` to reproduce the pre-root behaviour.
+    """
     limit = kw.pop("limit", 0)
     files = list(iter_videos(root, video_dirs_only=kw.pop("video_dirs_only", False)))
     if limit:
         files = files[:limit]
-    return build_index(files, out_path, **kw)
+    return build_index(files, out_path, root=str(root) if relative else "", **kw)

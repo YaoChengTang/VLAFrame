@@ -1,4 +1,5 @@
-"""Command line: ``vlaframe transcode | index | merge | info | seal | get | bench``.
+"""Command line: ``vlaframe transcode | index | merge | rebase | info | seal |
+get | bench``.
 
 Thin wrappers over the library. Everything the CLI does is available as a
 function; the CLI exists so a corpus sweep does not need a driver script.
@@ -18,6 +19,7 @@ from . import __version__
 from ._format import seal_sorted
 from .index import build_index, iter_videos
 from .merge import merge_indexes
+from .rebase import rebase_index
 from .reader import FrameReader
 from .transcode import TranscodeSpec, probe, transcode
 
@@ -72,16 +74,22 @@ def _cmd_index(a) -> int:
         iter_videos(root, video_dirs_only=a.video_dirs_only))
     if a.limit:
         files = files[:a.limit]
-    print(f"indexing {len(files):,} file(s) under {root}", flush=True)
+    # Storing paths relative to the tree being walked is the default: an index
+    # whose strings carry the mount point stops matching the moment the corpus
+    # is mounted anywhere else, and nothing about that fails at open time.
+    store_root = "" if a.absolute or root.is_file() else str(root)
+    print(f"indexing {len(files):,} file(s) under {root}"
+          f"{'' if store_root else ' (absolute paths)'}", flush=True)
     t0 = time.perf_counter()
 
     def progress(i, n, path):
         if i % 500 == 0:
             print(f"  [{i}/{n}] {time.perf_counter()-t0:.0f}s", flush=True)
 
-    st = build_index(files, a.out, progress=progress)
+    st = build_index(files, a.out, root=store_root, progress=progress)
     print(f"\nindexed {st['videos']:,} videos, {st['frames']:,} frames, "
           f"{st['param_sets']} parameter set(s), {st['failed']} failed")
+    print(f"  root: {st['root'] or '(none, paths are absolute)'}")
     print(f"index {st['bytes']/1e6:.1f} MB = {st['bytes_per_frame']:.2f} B/frame; "
           f"{st['explicit_pos']} video(s) needed explicit byte offsets; "
           f"built in {time.perf_counter()-t0:.0f}s")
@@ -131,7 +139,7 @@ def _cmd_merge(a) -> int:
 
 
 def _cmd_info(a) -> int:
-    with FrameReader(a.index) as r:
+    with FrameReader(a.index, root=a.root) as r:
         n = len(r)
         frames = sum(r.index.meta(i).n_frames for i in range(n))
         print(f"{a.index}")
@@ -141,6 +149,15 @@ def _cmd_info(a) -> int:
         lookup = "bisect (paths sorted)" if r.index.paths_sorted else \
             "dict (paths not sorted -- see `vlaframe seal`)"
         print(f"  path lookup  : {lookup}")
+        print(f"  paths        : "
+              + ("relative to a root" if r.index.relative_paths else "absolute"))
+        print(f"  stored root  : {r.index.stored_root or '(none)'}")
+        if r.index.root_override_ignored:
+            print(f"  root override: IGNORED -- this index stores absolute "
+                  f"paths, so there is no prefix to replace. `vlaframe rebase "
+                  f"--root ...` first.")
+        elif r.index.root != r.index.stored_root:
+            print(f"  root override: {r.index.root}")
         print(f"  file size    : {os.path.getsize(a.index)/1e6:.1f} MB "
               f"({os.path.getsize(a.index)/max(frames,1):.2f} B/frame)")
         for i in range(min(a.show, n)):
@@ -148,6 +165,46 @@ def _cmd_info(a) -> int:
             print(f"    [{i}] {m.width}x{m.height} {m.n_frames:>7} frames  "
                   f"{m.n_keys:>5} keys  {m.path}")
     return 0
+
+
+def _cmd_rebase(a) -> int:
+    """Move an index's stored paths onto a different root.
+
+    The paths are ~1.5% of a `.vfi` and the per-frame arrays are the rest, and
+    nothing in the arrays depends on the path -- so changing where a corpus
+    lives is a rewrite of that 1.5%, not a rebuild.
+    """
+    paths = []
+    for p in a.index:
+        paths.extend(sorted(glob.glob(p)) if any(c in p for c in "*?[") else [p])
+    if not paths:
+        print("no index files matched", file=sys.stderr)
+        return 1
+    if a.out and len(paths) > 1:
+        print("--out takes one index; pass --in-place for a sweep",
+              file=sys.stderr)
+        return 1
+
+    done = failed = 0
+    for p in paths:
+        try:
+            st = rebase_index(p, root=a.root, to_absolute=a.to_absolute,
+                              out_path=a.out, in_place=a.in_place)
+        except Exception as exc:
+            failed += 1
+            print(f"  FAILED {p}\n    {type(exc).__name__}: {exc}", flush=True)
+            continue
+        done += 1
+        where = "in place" if st["in_place"] else f"-> {st['out']}"
+        print(f"  {st['videos']:>8,} videos  {where}", flush=True)
+        print(f"      root  {st['old_root'] or '(none)'} -> "
+              f"{st['new_root'] or '(none)'}", flush=True)
+        print(f"      first {st['sample']}", flush=True)
+        print(f"      strings {st['strings_bytes']:,} B, "
+              f"{st['gap_bytes']:,} B freed before the records", flush=True)
+    print(f"\nrebased {done}/{len(paths)}"
+          f"{f', {failed} failed' if failed else ''}")
+    return 1 if failed else 0
 
 
 def _cmd_seal(a) -> int:
@@ -180,7 +237,8 @@ def _cmd_seal(a) -> int:
 
 
 def _cmd_get(a) -> int:
-    with FrameReader(a.index, backend=a.backend, threads=a.threads) as r:
+    with FrameReader(a.index, root=a.root, backend=a.backend,
+                     threads=a.threads) as r:
         video = int(a.video) if a.video.isdigit() else a.video
         img = r.rgb(video, a.frame)
         print(f"frame {a.frame} of {video}: {img.shape} {img.dtype}")
@@ -197,7 +255,8 @@ def _cmd_get(a) -> int:
 
 def _cmd_bench(a) -> int:
     rnd = random.Random(a.seed)
-    with FrameReader(a.index, backend=a.backend, threads=a.threads) as r:
+    with FrameReader(a.index, root=a.root, backend=a.backend,
+                     threads=a.threads) as r:
         n = len(r)
         picks = []
         while len(picks) < a.n + 20:
@@ -247,6 +306,9 @@ def main(argv=None) -> int:
     i.add_argument("root"); i.add_argument("out")
     i.add_argument("--limit", type=int, default=0)
     i.add_argument("--video-dirs-only", dest="video_dirs_only", action="store_true")
+    i.add_argument("--absolute", action="store_true",
+                   help="store absolute paths instead of paths relative to "
+                        "<root>. The index then only matches this mount point.")
     i.set_defaults(fn=_cmd_index)
 
     m = sub.add_parser("merge", help="combine index shards into one .vfi")
@@ -261,7 +323,24 @@ def main(argv=None) -> int:
 
     f = sub.add_parser("info", help="summarise an index")
     f.add_argument("index"); f.add_argument("--show", type=int, default=5)
+    f.add_argument("--root", default=None,
+                   help="resolve stored paths against this prefix instead of "
+                        "the one recorded in the file")
     f.set_defaults(fn=_cmd_info)
+
+    rb = sub.add_parser("rebase", help="move an index's stored paths onto a "
+                                       "different root, without rebuilding")
+    rb.add_argument("index", nargs="+", help="paths or globs")
+    rb.add_argument("--root", default=None,
+                    help="the prefix the stored paths become relative to")
+    rb.add_argument("--to-absolute", dest="to_absolute", action="store_true",
+                    help="inverse: fold the root back into every path")
+    rb.add_argument("--out", default=None,
+                    help="write here instead of <index>.rebased (one index only)")
+    rb.add_argument("--in-place", dest="in_place", action="store_true",
+                    help="edit the input. Cheap (the arrays are never read) and "
+                         "destructive; without it the input is left untouched.")
+    rb.set_defaults(fn=_cmd_rebase)
 
     s = sub.add_parser("seal", help="mark an existing index as path-sorted, "
                                     "in place, after verifying that it is")
@@ -273,6 +352,8 @@ def main(argv=None) -> int:
     g.add_argument("index"); g.add_argument("video"); g.add_argument("frame", type=int)
     g.add_argument("--backend", default="cpu", choices=("cpu", "gpu"))
     g.add_argument("--threads", type=int, default=1)
+    g.add_argument("--root", default=None,
+                   help="resolve stored paths against this prefix")
     g.add_argument("--out", default=None, help="write a PNG/JPG here")
     g.set_defaults(fn=_cmd_get)
 
@@ -281,6 +362,8 @@ def main(argv=None) -> int:
     b.add_argument("-n", type=int, default=300)
     b.add_argument("--backend", default="cpu", choices=("cpu", "gpu"))
     b.add_argument("--threads", type=int, default=1)
+    b.add_argument("--root", default=None,
+                   help="resolve stored paths against this prefix")
     b.add_argument("--seed", type=int, default=0)
     b.set_defaults(fn=_cmd_bench)
 

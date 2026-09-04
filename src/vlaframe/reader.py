@@ -118,9 +118,10 @@ class FrameReader:
     here.
     """
 
-    def __init__(self, index_path: str, *, backend: str = "cpu", threads: int = 1,
+    def __init__(self, index_path: str, *, root: str | None = None,
+                 backend: str = "cpu", threads: int = 1,
                  persistent: bool = True):
-        self.index = IndexFile(index_path)
+        self.index = IndexFile(index_path, root=root)
         self.backend = backend
         self.persistent = persistent
         self.pool = DecoderPool(backend, threads)
@@ -129,10 +130,16 @@ class FrameReader:
     def __len__(self) -> int:
         return self.index.n_videos
 
+    @property
+    def root(self) -> str:
+        """The prefix stored paths are resolved against. ``""`` when absolute."""
+        return self.index.root
+
     def vid_of(self, path: str) -> int:
         vid = self.index.find(path)
         if vid is None:
-            raise KeyError(f"{path} is not in this index")
+            raise KeyError(f"{path} is not in this index"
+                           + (f" (root={self.index.root!r})" if self.index.root else ""))
         return vid
 
     def _resolve(self, video: int | str) -> VideoMeta:
@@ -146,7 +153,8 @@ class FrameReader:
         return m.width, m.height
 
     def paths(self) -> list[str]:
-        return [self.index.meta(i).path for i in range(self.index.n_videos)]
+        """Absolute paths, so a caller can open what it gets back."""
+        return [self.index.abspath(i) for i in range(self.index.n_videos)]
 
     # ── plumbing ──────────────────────────────────────────────────────
     def _pts(self, m: VideoMeta) -> np.ndarray:
@@ -222,10 +230,13 @@ class FrameReader:
         """Decode one frame and return it as an ``av.VideoFrame`` (yuv420p)."""
         m = self._resolve(video)
         lo, hi, feed = self._plan(m, frame)
+        # The stored path is relative when the index has a root, so resolve it
+        # before opening: `m.path` identifies the video, `abs_path` locates it.
+        abs_path = self.index.join_root(m.path)
         # try/finally, not a bare close after the read: a read that raises would
         # otherwise leak the descriptor, and at corpus scale that is an EMFILE a
         # few thousand samples later rather than an obvious failure here.
-        fd = os.open(m.path, os.O_RDONLY)
+        fd = os.open(abs_path, os.O_RDONLY)
         try:
             buf = os.pread(fd, hi - lo, lo)
         finally:
@@ -248,7 +259,7 @@ class FrameReader:
         for fr in cc.decode(None):
             if fr.pts == target_ts:
                 return self._normalize(fr)
-        raise KeyError(f"{m.path}: frame {frame} was never emitted "
+        raise KeyError(f"{abs_path}: frame {frame} was never emitted "
                        f"(fed {len(feed)} packets)")
 
     def rgb(self, video: int | str, frame: int) -> np.ndarray:

@@ -71,6 +71,7 @@ vlaframe index /clips corpus.vfi
 vlaframe merge corpus.vfi 'shards/*.vfi' --verify
 vlaframe info corpus.vfi                       # reports whether lookups bisect
 vlaframe seal 'shards/*.vfi'                   # upgrade indexes built before v0.1.1
+vlaframe rebase corpus.vfi --root /clips       # move stored paths onto a root
 
 # 3. read
 vlaframe get corpus.vfi 0 1234 --out frame.png
@@ -192,6 +193,47 @@ rather than 76 GB — because three things are derived rather than stored:
 
 Each is **validated per video at build time**, and any video that violates the
 assumption stores an explicit array and sets a flag. Nothing is assumed globally.
+
+### Paths are stored relative to a root
+
+The index records the prefix its videos share once, and each record holds only
+the remainder:
+
+```
+root    /data/corpus/RoboChallenge/ur5
+stored  video_global/00000000-....mp4
+```
+
+This matters because `find` matches by exact bytes. An index that stored
+absolute paths was a function of where the corpus happened to be mounted and of
+what the directories above the videos were called, so renaming a dataset
+directory, or mounting the same corpus under a different prefix on another
+machine, made **every** lookup miss — with nothing failing at open time, because
+the file is still a perfectly valid index.
+
+`find` accepts either form: an absolute path has the root stripped before the
+bisection, a relative one is used as is. And the root is overridable at open
+time, which is the point — a corpus that moved needs a caller that says so, not
+a rebuilt index:
+
+```python
+FrameReader("leaf.vfi", root="/new/mount/RoboChallenge/ur5")
+```
+
+`off_root == 0` means "no root, the strings are absolute". Those 8 bytes were
+reserved-and-zero in the original header, so indexes written before roots
+existed keep reading untouched — this is not a format version bump.
+
+To move an existing index onto a root without rebuilding it, see `vlaframe
+rebase` below: the paths are ~1.5% of a `.vfi` and nothing in the per-frame
+arrays depends on them, so it rewrites that 1.5% and leaves the rest in place.
+Measured on a real 148.6 MB / 8,812-video index: **0.36 s**.
+
+```bash
+vlaframe rebase leaf.vfi --root /data/corpus/RoboChallenge/ur5   # -> leaf.vfi.rebased
+vlaframe rebase 'index_v3_leaves/*.vfi' --root ... --in-place    # cheap and destructive
+vlaframe rebase leaf.vfi --to-absolute                           # the inverse
+```
 
 ## Performance
 
@@ -346,10 +388,12 @@ src/vlaframe/
     index.py       function 2 — offline index construction
     reader.py      function 3 — online random access
     merge.py       function 4 — combine shards, byte for byte
+    rebase.py      function 5 — move stored paths onto a root, without rebuilding
     _format.py     the .vfi binary format
-    cli.py         vlaframe transcode | index | merge | info | seal | get | bench
+    cli.py         vlaframe transcode | index | merge | rebase | info | seal | get | bench
 tests/
     test_correctness.py   the bit-exactness gate
     test_memory.py        the no-per-video-state gate
     test_merge.py         the merge-is-indistinguishable gate
+    test_root.py          the path-root gate
 ```
